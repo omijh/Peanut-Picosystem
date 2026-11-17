@@ -2,46 +2,44 @@
 
 A fast, lightweight Game Boy (DMG) emulator ported to the **Pimoroni PicoSystem** (RP2040) powered by **Peanut-GB**.
 
-Features **edge-to-edge fullscreen 240×240 scaling**, **persistent Flash battery saves**, multiple color palettes, and full 60 FPS performance.
+Features **edge-to-edge fullscreen 240×240 scaling**, **full Save State persistence with auto-resume**, multiple color palettes, and locked 60 FPS performance.
 
 ---
 
 ## Highlights
 
+- **Full Save State & Auto-Resume**:
+  - Save your game at **any exact moment** (CPU registers, RAM, VRAM, and cartridge state).
+  - Perfect for games without in-game save menus (action platformers, arcade games, homebrews like *Karpe Diem*).
+  - **Auto-Resume on Startup**: When you power on your PicoSystem, it automatically resumes right from your last save state!
+  - Manual quick-load also supported (instantly reload a tricky section without restarting).
 - **Edge-to-Edge 240×240 Display**:
   - Scales Game Boy graphics to take up the **entire 240×240 IPS display** with zero black borders by default!
-  - Supports 3 selectable display modes:
-    1. **Fullscreen (240×240)**: Fills the entire screen edge-to-edge.
-    2. **Aspect Fit (240×216)**: Full horizontal width preserving exact 10:9 ratio with tiny 12px top/bottom letterbox.
-    3. **Pixel-Perfect (160×144)**: Centered 1:1 original resolution with retro bezel.
-- **Persistent Flash Battery Saves**: 
-  - Supports MBC1, MBC2, and MBC3 cartridge save RAM (up to 32 KB, fully supporting *Pokémon Red, Blue, Yellow, Gold, Silver*).
-  - Automatically commits battery saves to onboard non-volatile QSPI Flash memory (at the 15 MB sector mark).
-  - Data survives power-off, resets, and dead battery.
-  - On-screen `"SAVED!"` banner and green LED indicator when saving.
+  - 3 selectable display modes: Fullscreen (240×240), Aspect Fit (240×216), and Pixel-Perfect (160×144).
+- **Persistent Non-Volatile Storage**:
+  - Saves are streamed in 256-byte pages directly to the 16 MB onboard Flash (at offset 15 MB).
+  - Survives power-off, reboots, and dead batteries.
 - **3 Color Palettes**:
-  - Classic DMG Olive Green
-  - Pocket B&W (Crisp grayscale)
-  - Game Boy Light (Teal backlight)
+  - Classic DMG Olive Green, Pocket B&W (Grayscale), and Game Boy Light (Teal backlight).
 - **Zero External Storage Needed**:
-  - ROMs are embedded directly into the 16 MB onboard Flash via `embed_rom.py`.
-- **Tested Out-of-the-Box**:
-  - Includes Matt Currie's renowned `dmg-acid2` graphical test ROM by default so you can build and flash right away.
+  - ROMs are embedded directly into Flash via `embed_rom.py`.
 
 ---
 
-## Controls
+## Controls & Hotkeys
 
-| Game Boy Button | PicoSystem Button | Action |
+| Action | Button Combination | Description |
 | :--- | :--- | :--- |
-| **D-Pad** | **D-Pad** | Directional controls |
-| **A** | **A** | Primary action |
-| **B** | **B** | Secondary action / Cancel |
-| **START** | **X** | Start / In-game menu |
+| **D-Pad** | **D-Pad** | Directional movement |
+| **A / B** | **A / B** | Primary / Secondary actions |
+| **START** | **X** | Start / In-game pause |
 | **SELECT** | **Y** | Select |
-| **Force Save to Flash** | Hold **X + Y** (1.5s) | Manually commits SRAM save data to Flash |
-| **Cycle Palette** | Hold **X + Y** and tap **UP** | Cycles through DMG, Pocket, and Teal palettes |
-| **Cycle Display Mode** | Hold **X + Y** and tap **DOWN** | Cycles Fullscreen (240×240) ⇄ Aspect-Fit ⇄ 1:1 Centered |
+| **Quick Save State** | Hold **X + Y** (1.0s) | Saves complete snapshot to Flash. Green LED blinks & shows `"STATE SAVED!"` |
+| **Quick Load State** | Hold **A + B** (1.0s) | Immediately reloads saved snapshot. Shows `"STATE LOADED!"` |
+| **Auto-Resume on Boot** | *Turn power ON* | Automatically restores and continues from your last save state! |
+| **Fresh Boot (Skip State)** | Hold **Y** on power-up | Skips saved state and boots from the game's title screen |
+| **Cycle Palette** | Hold **X + Y** and tap **UP** | Cycles Classic DMG ⇄ Pocket Grayscale ⇄ Teal Light |
+| **Cycle Display Mode** | Hold **X + Y** and tap **DOWN** | Cycles Fullscreen (240×240) ⇄ Aspect-Fit (240×216) ⇄ 1:1 Centered |
 
 ---
 
@@ -69,15 +67,13 @@ git clone https://github.com/omijh/Peanut-Picosystem.git
 cd Peanut-Picosystem
 ```
 
-*(If you didn't download the Pico SDK or PicoSystem SDK into the repository root, set the environment variables: `export PICO_SDK_PATH=/path/to/pico-sdk` and `export PICOSYSTEM_DIR=/path/to/picosystem`)*
-
-### 3. Load Your Own Game Boy ROM (e.g. Pokémon)
+### 3. Load Your Own Game Boy ROM
 
 1. Place your `.gb` file in the project root:
    ```bash
    python3 embed_rom.py <your_game>.gb
    ```
-   *(This generates `rom.h`, automatically updating `main.cpp` for recompilation)*
+   *(This generates `rom.h` and automatically marks `main.cpp` for recompilation)*
 
 ### 4. Build the Firmware
 
@@ -97,24 +93,24 @@ build/peanut_picosystem.uf2
 2. Hold down the **X** button while flipping the power switch on.
 3. The device will mount as a USB mass-storage drive named **`RPI-RP2`**.
 4. Drag and drop `build/peanut_picosystem.uf2` onto the `RPI-RP2` drive.
-5. The device will automatically flash and launch your game in edge-to-edge fullscreen!
+5. The device will automatically flash and launch your game!
 
 ---
 
-## How the Save System Works
+## How the Save State System Works
 
-Game Boy cartridges (like Pokémon) store save games in Cartridge RAM (`cart_ram`). Because the RP2040's SRAM is volatile, the emulator mirrors this memory to the 16 MB QSPI Flash:
+Instead of relying solely on cartridge battery saves (which many arcade and homebrew games lack), the emulator serializes a complete snapshot of the system:
 
-1. **Auto-Save Detection**: Whenever the game writes to Cartridge RAM to save (e.g., saving through Pokémon's in-game START menu), a dirty flag is set. Once writes settle for 2.5 seconds, the emulator writes the 32 KB block into the 15 MB Flash sector.
-2. **Manual Save Combo**: You can hold **X + Y** for 1.5 seconds at any time to force an immediate Flash write.
-3. **Boot-Up Restore**: On startup, `init()` reads the 15 MB Flash sector, validates a magic header (`PGBS`) and checksum, and restores the save data back into memory.
+1. **State Payload**: Includes `struct gb_s` (CPU registers, PC, SP, timers, flags, 8 KB WRAM, 8 KB VRAM, OAM, HRAM) and the 32 KB Cartridge RAM (~50 KB total).
+2. **Flash Streaming**: Writes data in 256-byte hardware pages to a dedicated 64 KB sector at offset 15 MB in Flash, protected by a magic header (`STAT`) and a 32-bit checksum.
+3. **Auto-Resume**: On boot, `init()` checks for a valid state in Flash. If verified, it restores all memory and registers, re-hooks the native C++ display/read callbacks, and seamlessly resumes gameplay.
 
 ---
 
 ## Project Structure
 
 ```text
-├── main.cpp                  # Emulator glue code, scaling renderer, inputs, Flash saves
+├── main.cpp                  # Emulator glue code, scaling renderer, inputs, Save State engine
 ├── peanut_gb.h               # Single-file Game Boy emulator core (by Mahyar Koshkouei)
 ├── dmg-acid2.gb.h            # Default graphical test ROM (by Matt Currie)
 ├── embed_rom.py              # Python utility to convert .gb ROMs into rom.h

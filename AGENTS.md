@@ -25,18 +25,38 @@ Because the RP2040 has 264 KB of SRAM, memory layout must be managed strictly:
 | Memory Consumer | Location | Size | Notes |
 | :--- | :--- | :--- | :--- |
 | **PicoSystem Framebuffer (`SCREEN`)** | SRAM | **115.2 KB** | 240 × 240 × 2 bytes. Retained between frames. |
-| **Peanut-GB CPU & State (`gb_s`)** | SRAM | **~16 KB** | Includes 8 KB WRAM, 8 KB VRAM, OAM, HRAM, and CPU registers. |
+| **Peanut-GB CPU & State (`gb_s`)** | SRAM | **~17.1 KB** | Includes 8 KB WRAM, 8 KB VRAM, OAM, HRAM, and CPU registers. |
 | **Cartridge Battery RAM (`cart_ram`)** | SRAM | **32 KB** | Accommodates 4 banks of 8 KB (sufficient for MBC1, MBC2, and MBC3 / Pokémon Gen 1 & 2). |
-| **Free SRAM Headroom** | SRAM | **~100 KB** | Available for stack, heap, and runtime. |
+| **Free SRAM Headroom** | SRAM | **~99 KB** | Available for stack, heap, and runtime. |
 | **Game Boy ROM (`custom_rom_data`)** | **Flash** | **Up to ~14 MB** | Marked `const` so it lives in Flash and executes in place via XIP cache. Never copy ROMs into RAM. |
-| **Battery Save Sector** | **Flash** | **36 KB** | Reserved at offset `15 MB` (`0x00F00000`) for non-volatile cartridge SRAM saves. |
+| **Save State Sector** | **Flash** | **64 KB** | Reserved at offset `15 MB` (`0x00F00000`) for full emulator snapshot + SRAM. |
 
 > [!CAUTION]
 > **Do not allocate large static buffers in SRAM.** All textures, lookup tables, and ROM images must be declared `const` to reside in Flash memory.
 
 ---
 
-## 3. Display Scaling Engine (240×240)
+## 3. Save State & Persistence Architecture
+
+Because many action and homebrew Game Boy games (such as *Karpe Diem*) do not have in-game battery save menus, the emulator implements a **Full Save State Engine**:
+
+1. **State Snapshot Payload**:
+   - `StateHeader` (magic `0x53544154` / "STAT", version, payload sizes, 32-bit checksum).
+   - Entire `struct gb_s` (~17.1 KB): CPU registers (PC, SP, A, F, BC, DE, HL), timers, flags, 8 KB WRAM, 8 KB VRAM, OAM, HRAM.
+   - `cart_ram` (32 KB): Cartridge SRAM.
+   - Total payload: ~49.9 KB.
+2. **Streaming Page Writer (`FlashWriter`)**:
+   - Instead of allocating a 64 KB intermediate buffer in SRAM (which would starve RAM), `FlashWriter` uses a single **256-byte** page buffer on the stack.
+   - Data is streamed in 256-byte chunks directly to `flash_range_program()`.
+3. **Interrupt Safety**:
+   - `save_and_disable_interrupts()` must precede all flash operations, and `restore_interrupts()` must follow.
+4. **Pointer Re-hooking on Restore**:
+   - When `load_state_from_flash()` overwrites `gb`, it immediately re-assigns all native C++ callbacks (`gb_rom_read`, `gb_cart_ram_read`, `gb_cart_ram_write`, `gb_error`, `lcd_draw_line`, `direct.priv`) to ensure pointers remain valid across firmware builds.
+   - `gb.direct.joypad` is reset to `0xFF` to prevent stuck button states.
+
+---
+
+## 4. Display Scaling Engine (240×240)
 
 The Game Boy PPU generates 160×144 scanlines, while PicoSystem has a native 240×240 IPS LCD.
 The emulator supports three modes (switched with `X + Y + DOWN`):
@@ -53,28 +73,13 @@ The emulator supports three modes (switched with `X + Y + DOWN`):
 
 ---
 
-## 4. Flash Persistence Architecture
-
-Writing to RP2040 Flash memory requires strict precautions:
-
-1. **Bus Stall during Flash operations**:
-   - The RP2040 executes code from Flash (XIP). When `flash_range_erase` or `flash_range_program` is invoked, Flash cache reads are disabled.
-   - **Always disable interrupts** using `uint32_t ints = save_and_disable_interrupts();` before touching Flash, and re-enable with `restore_interrupts(ints);`.
-2. **Alignment Rules**:
-   - `flash_range_erase` must be aligned to `FLASH_SECTOR_SIZE` (4096 bytes).
-   - `flash_range_program` must be aligned to `FLASH_PAGE_SIZE` (256 bytes).
-3. **Data Verification**:
-   - Saves are prefixed with `struct SaveHeader` containing `magic = 0x50474253` (`PGBS`), size, and a 32-bit additive checksum to prevent restoring corrupted data.
-
----
-
 ## 5. Key Files & Responsibilities
 
 - **`main.cpp`**:
-  - `init()`: Sets up LUT tables, reads existing Flash save data into `cart_ram`, initializes Peanut-GB, and sets up the LCD line renderer.
-  - `update(uint32_t tick)`: Polls PicoSystem hardware buttons, maps them to `gb.direct.joypad_bits`, manages the auto-save write timer, handles hotkeys (palette switch, display mode switch, force save), and calls `gb_run_frame(&gb)`.
-  - `draw(uint32_t tick)`: Renders bezels (if not in fullscreen) and on-screen save notifications.
-  - `lcd_draw_line()`: Scanline callback from Peanut-GB. Implements real-time scaling (Fullscreen 240×240, Aspect Fit 240×216, or 1:1 centered).
+  - `init()`: Sets up LUT tables, checks Flash for saved state (with auto-resume), initializes Peanut-GB, and sets up LCD line renderer.
+  - `update(uint32_t tick)`: Polls buttons, checks hold combos (Quick Save: `X + Y`, Quick Load: `A + B`, Hotkeys: `X+Y+UP` / `X+Y+DOWN`), runs `gb_run_frame(&gb)`.
+  - `draw(uint32_t tick)`: Renders bezels (if in letterbox/centered mode) and onscreen notification banners.
+  - `save_state_to_flash()` / `load_state_from_flash()`: Serializes and restores the full emulator state.
 - **`peanut_gb.h`**:
   - Upstream single-header Game Boy DMG emulator core.
 - **`embed_rom.py`**:
