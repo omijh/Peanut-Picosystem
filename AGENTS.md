@@ -36,7 +36,24 @@ Because the RP2040 has 264 KB of SRAM, memory layout must be managed strictly:
 
 ---
 
-## 3. Flash Persistence Architecture
+## 3. Display Scaling Engine (240×240)
+
+The Game Boy PPU generates 160×144 scanlines, while PicoSystem has a native 240×240 IPS LCD.
+The emulator supports three modes (switched with `X + Y + DOWN`):
+
+1. **`DISPLAY_FULLSCREEN` (Default - 240×240)**:
+   - **Horizontal (160 → 240)**: Scaled using precomputed LUT `scale_x_lut[x] = (x * 2) / 3`.
+   - **Vertical (144 → 240)**: Integer scaling where each Game Boy scanline $L$ spans from $Y = (L \times 5) / 3$ to $Y_{next} = ((L + 1) \times 5) / 3$. Every 3 GB lines cleanly produce 5 screen scanlines ($48 \times 5 = 240$ lines).
+   - Zero black borders.
+2. **`DISPLAY_ASPECT_FIT` (240×216)**:
+   - Horizontal scaled to 240 pixels.
+   - Vertical scaled to 216 pixels ($144 \times 1.5$) with 12px letterbox bars top and bottom, preserving the exact 10:9 aspect ratio.
+3. **`DISPLAY_PIXEL_PERFECT` (160×144)**:
+   - Centered 1:1 original resolution with a classic dark bezel and Game Boy logo.
+
+---
+
+## 4. Flash Persistence Architecture
 
 Writing to RP2040 Flash memory requires strict precautions:
 
@@ -51,26 +68,23 @@ Writing to RP2040 Flash memory requires strict precautions:
 
 ---
 
-## 4. Key Files & Responsibilities
+## 5. Key Files & Responsibilities
 
 - **`main.cpp`**:
-  - `init()`: Reads existing Flash save data into `cart_ram`, initializes Peanut-GB with callbacks, and sets up the LCD line renderer.
-  - `update(uint32_t tick)`: Polls PicoSystem hardware buttons, maps them to `gb.direct.joypad_bits`, manages the auto-save write timer, and calls `gb_run_frame(&gb)`.
-  - `draw(uint32_t tick)`: Renders the outer bezel and on-screen save notifications.
-  - `lcd_draw_line()`: Scanline callback from Peanut-GB. Translates 160 pixels into 16-bit RGB values and centers them at `(x + 40, line + 48)` in `SCREEN->data`.
+  - `init()`: Sets up LUT tables, reads existing Flash save data into `cart_ram`, initializes Peanut-GB, and sets up the LCD line renderer.
+  - `update(uint32_t tick)`: Polls PicoSystem hardware buttons, maps them to `gb.direct.joypad_bits`, manages the auto-save write timer, handles hotkeys (palette switch, display mode switch, force save), and calls `gb_run_frame(&gb)`.
+  - `draw(uint32_t tick)`: Renders bezels (if not in fullscreen) and on-screen save notifications.
+  - `lcd_draw_line()`: Scanline callback from Peanut-GB. Implements real-time scaling (Fullscreen 240×240, Aspect Fit 240×216, or 1:1 centered).
 - **`peanut_gb.h`**:
-  - Upstream single-header Game Boy DMG emulator core. Configured with:
-    - `#define ENABLE_LCD 1`
-    - `#define ENABLE_SOUND 0` (for initial stability)
-    - `#define PEANUT_GB_12_COLOUR 0`
+  - Upstream single-header Game Boy DMG emulator core.
 - **`embed_rom.py`**:
-  - Converts a `.gb` binary into `rom.h` (`custom_rom_data` byte array).
+  - Converts a `.gb` binary into `rom.h` and touches `main.cpp` to ensure automatic recompilation.
 - **`build.sh`**:
-  - Detects the local ARM GNU toolchain, Pico SDK, and pioasm install paths, runs CMake, and executes parallel compilation.
+  - Detects the local ARM GNU toolchain, Pico SDK, and pioasm install paths, checks ROM freshness, runs CMake, and executes parallel compilation.
 
 ---
 
-## 5. Development & Testing Workflow
+## 6. Development & Testing Workflow
 
 ### Building the Project
 ```bash
@@ -88,15 +102,3 @@ python3 embed_rom.py <path/to/game.gb>
 rm -rf build
 ./build.sh
 ```
-
----
-
-## 6. Guidelines for Agents Modifying Code
-
-- **Adding Sound Support**:
-  - Peanut-GB supports audio hooks (`audio_read`, `audio_write`).
-  - PicoSystem provides `play(voice, freq, duration)`. For full chiptune APU synthesis, route square-wave and noise registers to a PWM audio interrupt on the secondary core (Core 1).
-- **Palette Enhancements**:
-  - Color palettes are defined in `palettes[3][4]`. New palettes can be added by expanding the array and updating the cycling logic in `update()`.
-- **Dual-Core Work**:
-  - If utilizing Core 1 (via `multicore_launch_core1`), ensure Core 1 is paused (`multicore_lockout_start_blocking()`) before any Flash erase/program operations.

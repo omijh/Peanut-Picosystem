@@ -16,6 +16,12 @@ pico_sdk_init()
 
 include(picosystem_sdk_import.cmake)
 
+# Ensure CMake tracks rom.h for rebuilds
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/rom.h")
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/rom.h")
+  set_source_files_properties(main.cpp PROPERTIES OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/rom.h")
+endif()
+
 picosystem_executable(
   ${PROJECT_NAME}
   ${PROJECT_SOURCES}

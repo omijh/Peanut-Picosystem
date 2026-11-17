@@ -29,6 +29,13 @@ if [ -d "$SCRIPT_DIR/picosystem" ]; then
   CMAKE_EXTRA_ARGS+=("-DPICOSYSTEM_DIR=$SCRIPT_DIR/picosystem")
 fi
 
+# Ensure main.cpp is rebuilt if rom.h is newer than the built UF2
+if [ -f "$SCRIPT_DIR/rom.h" ] && [ -f "$SCRIPT_DIR/build/peanut_picosystem.uf2" ]; then
+  if [ "$SCRIPT_DIR/rom.h" -nt "$SCRIPT_DIR/build/peanut_picosystem.uf2" ]; then
+    touch "$SCRIPT_DIR/main.cpp"
+  fi
+fi
+
 mkdir -p "$SCRIPT_DIR/build"
 cd "$SCRIPT_DIR/build"
 

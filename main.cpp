@@ -57,6 +57,15 @@ static const color_t palettes[3][4] = {
     { rgb(11, 15, 14), rgb(6, 12, 11), rgb(3, 7, 7), rgb(1, 3, 3) }
 };
 
+// Display Scaling Modes
+enum DisplayMode {
+    DISPLAY_FULLSCREEN = 0, // 240x240 Edge-to-Edge (Fills entire display)
+    DISPLAY_ASPECT_FIT = 1, // 240x216 (Full width, preserves 10:9 ratio, tiny 12px bar)
+    DISPLAY_PIXEL_PERFECT = 2 // 160x144 Centered with retro bezel
+};
+static DisplayMode display_mode = DISPLAY_FULLSCREEN;
+static uint8_t scale_x_lut[240];
+
 // Save Cartridge RAM to non-volatile Flash
 void save_to_flash() {
     uint32_t chk = 0;
@@ -132,26 +141,57 @@ void gb_error(struct gb_s *gb, const enum gb_error_e err, const uint16_t addr) {
     led(100, 0, 0);
 }
 
-// LCD Draw Line Callback (Scanline rendering)
-// Centers 160x144 Game Boy resolution inside the 240x240 PicoSystem display:
-// X offset: (240 - 160) / 2 = 40
-// Y offset: (240 - 144) / 2 = 48
+// LCD Draw Line Callback (Scanline rendering with scaling)
 void lcd_draw_line(struct gb_s *gb, const uint8_t *pixels, const uint_fast8_t line) {
     if (line >= 144 || SCREEN == nullptr || SCREEN->data == nullptr) {
         return;
     }
 
-    color_t *dest = SCREEN->data + ((line + 48) * 240 + 40);
     const color_t *pal = palettes[palette_idx];
 
-    for (int x = 0; x < 160; ++x) {
-        dest[x] = pal[pixels[x] & 3];
+    if (display_mode == DISPLAY_FULLSCREEN) {
+        // Mode 0: 240x240 Edge-to-Edge
+        // X: 160 -> 240 (1.5x)
+        // Y: 144 -> 240 (5/3x)
+        color_t line_buf[240];
+        for (int x = 0; x < 240; ++x) {
+            line_buf[x] = pal[pixels[scale_x_lut[x]] & 3];
+        }
+
+        int y_start = (line * 5) / 3;
+        int y_end   = ((line + 1) * 5) / 3;
+        for (int y = y_start; y < y_end; ++y) {
+            memcpy(SCREEN->data + (y * 240), line_buf, sizeof(line_buf));
+        }
+    } else if (display_mode == DISPLAY_ASPECT_FIT) {
+        // Mode 1: 240x216 (Full width, exact 10:9 aspect ratio, 12px letterbox top/bottom)
+        color_t line_buf[240];
+        for (int x = 0; x < 240; ++x) {
+            line_buf[x] = pal[pixels[scale_x_lut[x]] & 3];
+        }
+
+        int y_start = 12 + (line * 3) / 2;
+        int y_end   = 12 + ((line + 1) * 3) / 2;
+        for (int y = y_start; y < y_end; ++y) {
+            memcpy(SCREEN->data + (y * 240), line_buf, sizeof(line_buf));
+        }
+    } else {
+        // Mode 2: 160x144 Pixel-Perfect Centered with bezel
+        color_t *dest = SCREEN->data + ((line + 48) * 240 + 40);
+        for (int x = 0; x < 160; ++x) {
+            dest[x] = pal[pixels[x] & 3];
+        }
     }
 }
 
 // --- PicoSystem Lifecycle Hooks ---
 
 void init() {
+    // Precalculate horizontal 160 -> 240 scale lookup table: x_gb = (x * 2) / 3
+    for (int x = 0; x < 240; ++x) {
+        scale_x_lut[x] = (x * 2) / 3;
+    }
+
     // Load any existing persistent battery save from Flash
     load_from_flash();
 
@@ -205,6 +245,13 @@ void update(uint32_t tick) {
         palette_idx = (palette_idx + 1) % 3;
     }
 
+    // Shortcut: Tap DOWN while holding X + Y to cycle display modes (Fullscreen, Aspect-Fit, 1:1)
+    if (button(button::X) && button(button::Y) && pressed(button::DOWN)) {
+        display_mode = (DisplayMode)(((int)display_mode + 1) % 3);
+        // Clear screen to wipe any old bezel graphics when switching modes
+        clear();
+    }
+
     // Run 1 frame of emulation
     gb_run_frame(&gb);
 
@@ -214,32 +261,33 @@ void update(uint32_t tick) {
 }
 
 void draw(uint32_t tick) {
-    // Background bezels around the 160x144 viewport
-    pen(1, 1, 1); // Dark charcoal bezel
-    // Top border
-    frect(0, 0, 240, 48);
-    // Bottom border
-    frect(0, 192, 240, 48);
-    // Left border
-    frect(0, 48, 40, 144);
-    // Right border
-    frect(200, 48, 40, 144);
+    // Only render borders in non-fullscreen modes
+    if (display_mode == DISPLAY_PIXEL_PERFECT) {
+        pen(1, 1, 1); // Dark charcoal bezel
+        frect(0, 0, 240, 48);
+        frect(0, 192, 240, 48);
+        frect(0, 48, 40, 144);
+        frect(200, 48, 40, 144);
 
-    // Bezel Title
-    pen(6, 6, 6);
-    text("GAME BOY", 92, 28);
+        pen(6, 6, 6);
+        text("GAME BOY", 92, 28);
+    } else if (display_mode == DISPLAY_ASPECT_FIT) {
+        pen(0, 0, 0); // Black 12px letterbox bars
+        frect(0, 0, 240, 12);
+        frect(0, 228, 240, 12);
+    }
 
-    // Save notification banner
+    // Save notification banner (draws compactly on any mode)
     if (save_banner_frames > 0) {
         pen(0, 12, 0); // Green
-        frect(80, 204, 80, 16);
+        frect(80, 216, 80, 16);
         pen(15, 15, 15);
-        text("SAVED!", 100, 208);
+        text("SAVED!", 100, 220);
     } else if (save_hold_timer > 30) {
         // Holding save combo feedback
         pen(12, 8, 0);
-        frect(70, 204, 100, 16);
+        frect(70, 216, 100, 16);
         pen(15, 15, 15);
-        text("SAVING...", 92, 208);
+        text("SAVING...", 92, 220);
     }
 }

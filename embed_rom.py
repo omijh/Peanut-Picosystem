@@ -1,6 +1,8 @@
+#!/usr/bin/env bash
 #!/usr/bin/env python3
 import sys
 import os
+import time
 
 def main():
     if len(sys.argv) < 2:
@@ -35,7 +37,13 @@ def main():
 
         out.write("\n};\n")
 
-    print("Done! You can now recompile to build the new .uf2.")
+    # Touch main.cpp so build systems immediately trigger a recompile of main.cpp
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    main_cpp = os.path.join(script_dir, "main.cpp")
+    if os.path.exists(main_cpp):
+        os.utime(main_cpp, None)
+
+    print("Done! Updated main.cpp timestamp. Run ./build.sh to compile.")
 
 if __name__ == "__main__":
     main()
