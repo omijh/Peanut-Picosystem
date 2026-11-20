@@ -6,6 +6,8 @@ set(PROJECT_SOURCES
     main.cpp
 )
 
+set(PICO_BOARD pimoroni_picosystem)
+
 include(pico_sdk_import.cmake)
 
 project(${PROJECT_NAME} C CXX ASM)

@@ -2,6 +2,7 @@
 #include <cstring>
 #include "picosystem.hpp"
 #include "hardware/flash.h"
+#include "hardware/gpio.h"
 #include "hardware/sync.h"
 
 #define ENABLE_LCD 1
@@ -37,25 +38,40 @@ static const char *banner_text = "";
 static color_t banner_bg_color = rgb(0, 12, 0);
 
 // Hold timers for button combos
+static constexpr uint32_t COMBO_HOLD_FRAMES = 60;
+static constexpr uint32_t COMBO_HINT_FRAMES = 15;
 static uint32_t save_hold_timer = 0;
 static uint32_t load_hold_timer = 0;
+static bool save_combo_consumed = false;
+static bool load_combo_consumed = false;
 
 // ============================================================================
 // Flash Save State Persistence Architecture
 // ============================================================================
 // PicoSystem has 16MB of Flash. We reserve 64 KB at the 15 MB mark (0x00F00000).
-#define FLASH_STATE_OFFSET (15 * 1024 * 1024)
-#define FLASH_STATE_ADDR   ((const uint8_t *)(XIP_BASE + FLASH_STATE_OFFSET))
-#define STATE_MAGIC        0x53544154 // "STAT"
+#define FLASH_STATE_OFFSET    (15 * 1024 * 1024)
+#define FLASH_STATE_MAX_SIZE  (64 * 1024)
+#define FLASH_STATE_READ_ADDR ((const uint8_t *)(XIP_NOCACHE_NOALLOC_BASE + FLASH_STATE_OFFSET))
+#define STATE_MAGIC           0x53544154u // "STAT"
+#define STATE_VERSION         2u
+
+#ifdef PICO_FLASH_SIZE_BYTES
+static_assert(PICO_FLASH_SIZE_BYTES >= FLASH_STATE_OFFSET + FLASH_STATE_MAX_SIZE,
+              "PICO_FLASH_SIZE_BYTES too small for save state; build with PICO_BOARD=pimoroni_picosystem");
+#endif
 
 struct StateHeader {
-    uint32_t magic;      // STATE_MAGIC
-    uint32_t version;    // 1
+    uint32_t magic;      // STATE_MAGIC ("STAT")
+    uint32_t version;    // STATE_VERSION
     uint32_t gb_size;    // sizeof(struct gb_s)
     uint32_t ram_size;   // sizeof(cart_ram)
-    uint32_t checksum;   // additive checksum of gb + cart_ram
-    uint32_t reserved[3];
+    uint32_t checksum;   // FNV-1a 32-bit hash of gb + cart_ram
+    uint32_t rom_hash;   // FNV-1a 32-bit hash of ROM header + ROM_SIZE
+    uint32_t reserved[2];
 };
+
+static_assert(sizeof(StateHeader) + sizeof(gb) + sizeof(cart_ram) <= FLASH_STATE_MAX_SIZE,
+              "Save state exceeds 64 KB Flash reservation");
 
 // Streaming flash page writer (uses only 256 bytes of RAM!)
 struct FlashWriter {
@@ -88,16 +104,50 @@ struct FlashWriter {
     }
 };
 
-static uint32_t calc_state_checksum() {
-    uint32_t chk = 0;
-    const uint8_t *p_gb = (const uint8_t *)&gb;
-    for (size_t i = 0; i < sizeof(gb); ++i) {
-        chk += p_gb[i];
+static uint32_t fnv1a_update(uint32_t h, const uint8_t *data, size_t len) {
+    for (size_t i = 0; i < len; ++i) {
+        h ^= data[i];
+        h *= 16777619u;
     }
-    for (size_t i = 0; i < sizeof(cart_ram); ++i) {
-        chk += cart_ram[i];
+    return h;
+}
+
+static uint32_t calc_rom_hash() {
+    uint32_t h = 2166136261u;
+    uint32_t rom_size = (uint32_t)ROM_SIZE;
+    uint8_t size_bytes[4] = {
+        (uint8_t)(rom_size & 0xFFu),
+        (uint8_t)((rom_size >> 8) & 0xFFu),
+        (uint8_t)((rom_size >> 16) & 0xFFu),
+        (uint8_t)((rom_size >> 24) & 0xFFu)
+    };
+    h = fnv1a_update(h, size_bytes, sizeof(size_bytes));
+    if (ROM_SIZE > 0x0100u) {
+        size_t hdr_end = ROM_SIZE < 0x0150u ? (size_t)ROM_SIZE : 0x0150u;
+        h = fnv1a_update(h, (const uint8_t *)ROM_DATA + 0x0100u, hdr_end - 0x0100u);
     }
-    return chk;
+    return h;
+}
+
+static uint32_t calc_state_checksum(const uint8_t *gb_bytes, const uint8_t *ram_bytes) {
+    uint32_t h = 2166136261u;
+    h = fnv1a_update(h, gb_bytes, sizeof(gb));
+    h = fnv1a_update(h, ram_bytes, sizeof(cart_ram));
+    return h;
+}
+
+static bool verify_flash_state() {
+    StateHeader hdr;
+    memcpy(&hdr, FLASH_STATE_READ_ADDR, sizeof(hdr));
+    if (hdr.magic != STATE_MAGIC || hdr.version != STATE_VERSION ||
+        hdr.gb_size != sizeof(gb) || hdr.ram_size != sizeof(cart_ram) ||
+        hdr.rom_hash != calc_rom_hash()) {
+        return false;
+    }
+
+    const uint8_t *saved_gb = FLASH_STATE_READ_ADDR + sizeof(StateHeader);
+    const uint8_t *saved_ram = saved_gb + sizeof(gb);
+    return calc_state_checksum(saved_gb, saved_ram) == hdr.checksum;
 }
 
 // Forward declarations for callbacks
@@ -108,17 +158,22 @@ void gb_error(struct gb_s *gb, const enum gb_error_e err, const uint16_t addr);
 void lcd_draw_line(struct gb_s *gb, const uint8_t *pixels, const uint_fast8_t line);
 
 // Save full state (CPU + WRAM + VRAM + Cart RAM) to Flash
-void save_state_to_flash() {
+bool save_state_to_flash() {
     StateHeader hdr;
     hdr.magic = STATE_MAGIC;
-    hdr.version = 1;
+    hdr.version = STATE_VERSION;
     hdr.gb_size = sizeof(gb);
     hdr.ram_size = sizeof(cart_ram);
-    hdr.checksum = calc_state_checksum();
-    for (int i = 0; i < 3; ++i) hdr.reserved[i] = 0;
+    hdr.checksum = calc_state_checksum((const uint8_t *)&gb, cart_ram);
+    hdr.rom_hash = calc_rom_hash();
+    hdr.reserved[0] = 0;
+    hdr.reserved[1] = 0;
 
     uint32_t total_payload = sizeof(StateHeader) + sizeof(gb) + sizeof(cart_ram);
     uint32_t erase_bytes = ((total_payload + FLASH_SECTOR_SIZE - 1) / FLASH_SECTOR_SIZE) * FLASH_SECTOR_SIZE;
+
+    // Wait for any active screen DMA transfer before halting interrupts for Flash I/O
+    while (_is_flipping()) {}
 
     // Visual feedback: green LED
     led(0, 80, 0);
@@ -135,35 +190,29 @@ void save_state_to_flash() {
     restore_interrupts(ints);
 
     led(0, 0, 0);
-    cart_ram_dirty = false;
 
-    // Show onscreen banner
-    banner_text = "STATE SAVED!";
-    banner_bg_color = rgb(0, 12, 0);
-    banner_timer = 90; // ~1.5s at 60 FPS
+    bool ok = verify_flash_state();
+    if (ok) {
+        cart_ram_dirty = false;
+        banner_text = "STATE SAVED!";
+        banner_bg_color = rgb(0, 12, 0);
+        banner_timer = 90; // ~1.5s at 60 FPS
+    } else {
+        banner_text = "SAVE FAILED!";
+        banner_bg_color = rgb(14, 0, 0);
+        banner_timer = 90;
+    }
+    return ok;
 }
 
 // Restore full state from Flash
 bool load_state_from_flash() {
-    const StateHeader *hdr = (const StateHeader *)FLASH_STATE_ADDR;
-    if (hdr->magic != STATE_MAGIC || hdr->version != 1 ||
-        hdr->gb_size != sizeof(gb) || hdr->ram_size != sizeof(cart_ram)) {
+    if (!verify_flash_state()) {
         return false;
     }
 
-    const uint8_t *ptr = FLASH_STATE_ADDR + sizeof(StateHeader);
-    const uint8_t *saved_gb = ptr;
-    ptr += sizeof(gb);
-    const uint8_t *saved_ram = ptr;
-
-    // Verify checksum
-    uint32_t chk = 0;
-    for (size_t i = 0; i < sizeof(gb); ++i) chk += saved_gb[i];
-    for (size_t i = 0; i < sizeof(cart_ram); ++i) chk += saved_ram[i];
-
-    if (chk != hdr->checksum) {
-        return false;
-    }
+    const uint8_t *saved_gb = FLASH_STATE_READ_ADDR + sizeof(StateHeader);
+    const uint8_t *saved_ram = saved_gb + sizeof(gb);
 
     // Restore emulator state
     memcpy(&gb, saved_gb, sizeof(gb));
@@ -180,8 +229,9 @@ bool load_state_from_flash() {
     gb.display.lcd_draw_line = lcd_draw_line;
     gb.direct.priv = (void *)ROM_DATA;
 
-    // Release any joypad button latch
+    // Release any joypad button latch and clear dirty flag
     gb.direct.joypad = 0xFF;
+    cart_ram_dirty = false;
 
     return true;
 }
@@ -298,8 +348,9 @@ void init() {
     }
     gb_init_lcd(&gb, lcd_draw_line);
 
-    // If 'Y' is held during power-on/boot, start clean from Title Screen
-    bool fresh_boot = button(button::Y);
+    // PicoSystem populates _io after init(); buttons are active-low with pull-ups.
+    // If 'Y' is held during power-on/boot, start clean from Title Screen.
+    bool fresh_boot = !gpio_get(button::Y);
 
     if (!fresh_boot) {
         // Attempt to auto-resume from saved state
@@ -323,13 +374,37 @@ void update(uint32_t tick) {
     gb.direct.joypad_bits.select = !button(button::Y);
 
     // ------------------------------------------------------------------------
+    // Shortcuts: Hold X + Y and tap UP (palette) or DOWN (display mode)
+    // ------------------------------------------------------------------------
+    if (button(button::X) && button(button::Y)) {
+        if (pressed(button::UP)) {
+            palette_idx = (palette_idx + 1) % 3;
+            save_combo_consumed = true;
+            save_hold_timer = 0;
+        }
+        if (pressed(button::DOWN)) {
+            display_mode = (DisplayMode)(((int)display_mode + 1) % 3);
+            pen(0, 0, 0);
+            clear();
+            save_combo_consumed = true;
+            save_hold_timer = 0;
+        }
+    } else {
+        save_hold_timer = 0;
+        save_combo_consumed = false;
+    }
+
+    // ------------------------------------------------------------------------
     // QUICK SAVE STATE: Hold X + Y for 1.0 second
     // ------------------------------------------------------------------------
     if (button(button::X) && button(button::Y) && !button(button::UP) && !button(button::DOWN)) {
-        save_hold_timer++;
-        if (save_hold_timer > 60) { // 1.0s at 60 FPS
-            save_state_to_flash();
-            save_hold_timer = 0;
+        if (!save_combo_consumed) {
+            save_hold_timer++;
+            if (save_hold_timer >= COMBO_HOLD_FRAMES) { // 1.0s at 60 FPS
+                save_state_to_flash();
+                save_hold_timer = 0;
+                save_combo_consumed = true;
+            }
         }
     } else {
         save_hold_timer = 0;
@@ -339,38 +414,42 @@ void update(uint32_t tick) {
     // QUICK LOAD STATE: Hold A + B for 1.0 second
     // ------------------------------------------------------------------------
     if (button(button::A) && button(button::B) && !button(button::X) && !button(button::Y)) {
-        load_hold_timer++;
-        if (load_hold_timer > 60) { // 1.0s at 60 FPS
-            if (load_state_from_flash()) {
-                clear();
-                banner_text = "STATE LOADED!";
-                banner_bg_color = rgb(0, 10, 14); // Cyan
-                banner_timer = 90;
-            } else {
-                banner_text = "NO SAVE FOUND!";
-                banner_bg_color = rgb(14, 0, 0); // Red
-                banner_timer = 60;
+        if (!load_combo_consumed) {
+            load_hold_timer++;
+            if (load_hold_timer >= COMBO_HOLD_FRAMES) { // 1.0s at 60 FPS
+                if (load_state_from_flash()) {
+                    pen(0, 0, 0);
+                    clear();
+                    banner_text = "STATE LOADED!";
+                    banner_bg_color = rgb(0, 10, 14); // Cyan
+                    banner_timer = 90;
+                } else {
+                    banner_text = "NO SAVE FOUND!";
+                    banner_bg_color = rgb(14, 0, 0); // Red
+                    banner_timer = 60;
+                }
+                load_hold_timer = 0;
+                load_combo_consumed = true;
             }
-            load_hold_timer = 0;
         }
     } else {
         load_hold_timer = 0;
+        if (!(button(button::A) && button(button::B))) {
+            load_combo_consumed = false;
+        }
+    }
+
+    // Keep A+B masked from the restored frame until the user releases the combo
+    if (load_combo_consumed) {
+        gb.direct.joypad_bits.a = 1;
+        gb.direct.joypad_bits.b = 1;
     }
 
     // Auto-save battery RAM (Pokemon in-game saves)
     if (cart_ram_dirty && (time() - last_cart_write_ms > 2500)) {
-        save_state_to_flash();
-    }
-
-    // Shortcut: Tap UP while holding X + Y to cycle color palettes
-    if (button(button::X) && button(button::Y) && pressed(button::UP)) {
-        palette_idx = (palette_idx + 1) % 3;
-    }
-
-    // Shortcut: Tap DOWN while holding X + Y to cycle display modes
-    if (button(button::X) && button(button::Y) && pressed(button::DOWN)) {
-        display_mode = (DisplayMode)(((int)display_mode + 1) % 3);
-        clear();
+        if (!save_state_to_flash()) {
+            last_cart_write_ms = time();
+        }
     }
 
     // Run 1 frame of emulation
@@ -379,6 +458,24 @@ void update(uint32_t tick) {
     if (banner_timer > 0) {
         banner_timer--;
     }
+}
+
+static void draw_hold_banner(const char *label, uint32_t timer, color_t bg, color_t track_bg) {
+    pen(bg);
+    frect(54, 214, 132, 20);
+    pen(track_bg);
+    frect(58, 228, 124, 3);
+    int32_t fill_w = (int32_t)((timer * 124) / COMBO_HOLD_FRAMES);
+    if (fill_w > 124) {
+        fill_w = 124;
+    }
+    pen(15, 15, 15);
+    if (fill_w > 0) {
+        frect(58, 228, fill_w, 3);
+    }
+    int32_t tw = 0, th = 0;
+    measure(label, tw, th);
+    text(label, 120 - tw / 2, 217);
 }
 
 void draw(uint32_t tick) {
@@ -399,21 +496,17 @@ void draw(uint32_t tick) {
     }
 
     // On-screen feedback when holding Save or Load combos
-    if (save_hold_timer > 20) {
-        pen(12, 8, 0); // Amber
-        frect(60, 216, 120, 16);
-        pen(15, 15, 15);
-        text("SAVING STATE...", 68, 220);
-    } else if (load_hold_timer > 20) {
-        pen(0, 8, 12); // Blue
-        frect(60, 216, 120, 16);
-        pen(15, 15, 15);
-        text("LOADING STATE...", 65, 220);
+    if (save_hold_timer >= COMBO_HINT_FRAMES) {
+        draw_hold_banner("HOLD TO SAVE...", save_hold_timer, rgb(12, 8, 0), rgb(4, 3, 0));
+    } else if (load_hold_timer >= COMBO_HINT_FRAMES) {
+        draw_hold_banner("HOLD TO LOAD...", load_hold_timer, rgb(0, 8, 12), rgb(0, 3, 5));
     } else if (banner_timer > 0) {
         // Active notification banner
         pen(banner_bg_color);
-        frect(65, 216, 110, 16);
+        frect(60, 216, 120, 16);
         pen(15, 15, 15);
-        text(banner_text, 75, 220);
+        int32_t tw = 0, th = 0;
+        measure(banner_text, tw, th);
+        text(banner_text, 120 - tw / 2, 220);
     }
 }

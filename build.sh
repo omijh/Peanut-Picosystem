@@ -29,6 +29,14 @@ if [ -d "$SCRIPT_DIR/picosystem" ]; then
   CMAKE_EXTRA_ARGS+=("-DPICOSYSTEM_DIR=$SCRIPT_DIR/picosystem")
 fi
 
+CMAKE_EXTRA_ARGS+=("-DPICO_BOARD=pimoroni_picosystem")
+
+# Clean stale build cache if configured for the wrong PICO_BOARD (e.g. default 2MB 'pico')
+if [ -f "$SCRIPT_DIR/build/CMakeCache.txt" ] && ! grep -q '^PICO_BOARD:STRING=pimoroni_picosystem$' "$SCRIPT_DIR/build/CMakeCache.txt"; then
+  echo "Detected stale CMakeCache.txt (wrong PICO_BOARD); cleaning build directory..."
+  rm -rf "$SCRIPT_DIR/build"
+fi
+
 # Ensure main.cpp is rebuilt if rom.h is newer than the built UF2
 if [ -f "$SCRIPT_DIR/rom.h" ] && [ -f "$SCRIPT_DIR/build/peanut_picosystem.uf2" ]; then
   if [ "$SCRIPT_DIR/rom.h" -nt "$SCRIPT_DIR/build/peanut_picosystem.uf2" ]; then
