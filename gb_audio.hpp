@@ -6,6 +6,7 @@
 
 #ifndef GB_AUDIO_HOST_TEST
 #include "hardware/clocks.h"
+#include "hardware/dma.h"
 #include "hardware/gpio.h"
 #include "hardware/irq.h"
 #include "hardware/pwm.h"
@@ -21,12 +22,11 @@ static constexpr uint32_t GB_CPU_HZ = 4194304u;
 static constexpr uint32_t GB_AUDIO_SAMPLE_RATE = 32768u;
 static constexpr uint32_t GB_AUDIO_CYCLES_PER_SAMPLE = GB_CPU_HZ / GB_AUDIO_SAMPLE_RATE; // 128
 static constexpr uint32_t GB_AUDIO_SAMPLES_PER_SEQ_STEP = GB_AUDIO_SAMPLE_RATE / 512u;   // 64
-static constexpr uint16_t GB_AUDIO_PWM_WRAP = 255u;         // 8-bit level range (0..255)
-static constexpr float    GB_AUDIO_PWM_CARRIER_HZ = 61035.15625f; // 61.0 kHz ultrasonic carrier (250 MHz / (16 * 256))
-static constexpr int32_t  GB_AUDIO_PWM_MID = 128;
-static constexpr uint32_t GB_AUDIO_PIN = 11u;               // PicoSystem piezo buzzer (PWM Slice 5B)
-static constexpr uint32_t GB_AUDIO_TIMER_SLICE = 0u;        // Unused internal PWM slice for 32.8 kHz IRQ pacing
-static constexpr uint16_t GB_AUDIO_PACER_WRAP = 3814u;      // ~32,765.4 Hz sample IRQ at 250 MHz / 2
+static constexpr uint16_t GB_AUDIO_PWM_WRAP = 4095u;  // 12-bit 61.035 kHz ultrasonic carrier at 250 MHz / 1
+static constexpr int32_t  GB_AUDIO_PWM_MID = 2048;
+static constexpr uint32_t GB_AUDIO_FRAME_SAMPLES = 548u; // Authentic GB audio samples per frame (~59.73 Hz)
+static constexpr uint32_t GB_AUDIO_PIN = 11u;            // PicoSystem piezo buzzer (PWM Slice 5B)
+static constexpr uint32_t GB_AUDIO_DMA_CH = 1u;          // Fixed DMA channel (screen uses channel 0)
 
 struct GbApu {
     struct PulseChannel {
@@ -298,12 +298,14 @@ struct GbApu {
     uint8_t sweep_shift = 0;
     uint16_t sweep_shadow = 0;
 
-    // Frame sequencer (512 Hz) & idle ramp state
+    // Frame sequencer (512 Hz) & DSP filter / idle ramp state
     uint8_t seq_step = 0;
     uint8_t sample_counter = 0;
     uint8_t master_volume = 30; // 0..100%; intentionally preserved across reset()
     uint32_t silent_samples = 0;
     int32_t dc_bias = 0;
+    int32_t hpf_x1 = 0;
+    int32_t hpf_y1 = 0;
     int32_t lpf_acc = 0;
 
     void reset() {
@@ -324,6 +326,8 @@ struct GbApu {
         sample_counter = 0;
         silent_samples = 0;
         dc_bias = 0;
+        hpf_x1 = 0;
+        hpf_y1 = 0;
         lpf_acc = 0;
     }
 
@@ -585,14 +589,15 @@ struct GbApu {
         return (nr51 & ((1u << ch_idx) | (1u << (ch_idx + 4u)))) != 0u;
     }
 
-    static int32_t soft_clip_127(int32_t x) {
-        int32_t mag = (x < 0) ? -x : x;
-        if (mag <= 80) {
-            return x;
-        }
-        int32_t excess = mag - 80;
-        int32_t out = 80 + (47 * excess) / (excess + 47);
-        return (x < 0) ? -out : out;
+    // Shift-only cascaded soft-knee limiter (zero integer divides on M0+)
+    static int32_t soft_limit_s16(int32_t s) {
+        int32_t mag = (s < 0) ? -s : s;
+        if (mag > 20000) mag = 20000 + ((mag - 20000) >> 1);
+        if (mag > 26000) mag = 26000 + ((mag - 26000) >> 1);
+        if (mag > 30000) mag = 30000 + ((mag - 30000) >> 1);
+        if (mag > 32000) mag = 32000 + ((mag - 32000) >> 2);
+        if (mag > 32767) mag = 32767;
+        return (s < 0) ? -mag : mag;
     }
 
     int32_t nr50_mono_sum() const {
@@ -658,20 +663,32 @@ struct GbApu {
 
         int32_t target_bias = (any_audible || silent_samples <= 512u) ? GB_AUDIO_PWM_MID : 0;
         if (dc_bias < target_bias) {
-            dc_bias = std::min(dc_bias + 2, target_bias);
+            dc_bias = std::min(dc_bias + 32, target_bias);
         } else if (dc_bias > target_bias) {
-            dc_bias = std::max(dc_bias - 2, target_bias);
+            dc_bias = std::max(dc_bias - 32, target_bias);
         }
 
-        int32_t scaled_fp = (master_volume == 0u) ? 0 : ((mix * nr50_mono_sum()) << 4);
-        if (scaled_fp == 0 && lpf_acc > -4 && lpf_acc < 4) {
+        // Convert to signed Q15 range and run ~200 Hz 1-pole HPF (strips dead bass & DC steps)
+        int32_t x = (master_volume == 0u) ? 0 : ((mix * nr50_mono_sum()) << 5);
+        int32_t hpf_tmp = (hpf_y1 + x - hpf_x1) * 246;
+        // Truncate toward zero so negative decays reach exact 0 without sticking
+        int32_t y = (hpf_tmp >= 0) ? (hpf_tmp >> 8) : -((-hpf_tmp) >> 8);
+        hpf_x1 = x;
+        hpf_y1 = y;
+
+        // ~5.2 kHz 1-pole LPF preserves 2-4.5 kHz piezo resonance while smoothing aliasing
+        if (y == 0 && lpf_acc > -4 && lpf_acc < 4) {
             lpf_acc = 0;
         } else {
-            lpf_acc += (scaled_fp - lpf_acc) >> 1;
+            lpf_acc += (y - lpf_acc) >> 1;
         }
-        int32_t driven = (lpf_acc * 12) >> 8;
-        int32_t shaped = soft_clip_127(driven);
-        int32_t amp = (shaped * (int32_t)master_volume) / 100;
+
+        int32_t vol_scale = ((int32_t)master_volume * 384) / 100; // 0..384 (6.0x at 100% after >> 6)
+        int32_t s = soft_limit_s16((lpf_acc * vol_scale) >> 6);
+        int32_t amp = s >> 4; // -2047..+2047 (arithmetic shift acceptable for small signal)
+        if (s < 0 && s > -16) {
+            amp = 0;
+        }
         if (dc_bias < GB_AUDIO_PWM_MID) {
             amp = (amp * dc_bias) / GB_AUDIO_PWM_MID;
         }
@@ -789,7 +806,7 @@ struct GbApu {
 };
 
 enum AudioMode {
-    AUDIO_PWM_APU    = 0, // 4-channel polyphonic APU over 61.0 kHz ultrasonic PWM
+    AUDIO_PWM_APU    = 0, // 4-channel polyphonic APU over 12-bit 61.0 kHz DMA-paced PWM
     AUDIO_PIEZO_BEEP = 1, // Direct frequency piezo beeper tones
     AUDIO_OFF        = 2  // Muted
 };
@@ -798,21 +815,20 @@ struct GbAudioDriver;
 
 #ifndef GB_AUDIO_HOST_TEST
 static GbAudioDriver *g_gb_audio_driver = nullptr;
-static void __not_in_flash_func(gb_audio_pwm_irq_handler)();
+static void __not_in_flash_func(gb_audio_dma_irq_handler)();
 #endif
 
 struct GbAudioDriver {
-    static constexpr uint32_t RING_SIZE = 2048u;
-    static constexpr uint32_t RING_MASK = RING_SIZE - 1u;
-    static constexpr uint32_t TARGET_BUFFER_SAMPLES = 1500u;
-
     GbApu apu;
     AudioMode mode = AUDIO_PIEZO_BEEP;
     bool paused = false;
-    uint16_t ring[RING_SIZE] = {};
-    volatile uint32_t ring_read = 0;
-    volatile uint32_t ring_write = 0;
-    volatile uint16_t last_pwm_level = 0;
+    uint32_t duty_buf[2][GB_AUDIO_FRAME_SAMPLES] = {};
+    volatile uint8_t play_buf_idx = 0;
+    volatile bool dma_idle = true;
+    volatile bool buf_pending = false;
+    uint32_t frame_period_us = 16742u;
+    int pace_timer = -1;
+    bool dma_initialized = false;
     uint32_t last_beep_freq = 0;
 
     uint8_t get_volume() const {
@@ -836,6 +852,28 @@ struct GbAudioDriver {
     }
 
 #ifndef GB_AUDIO_HOST_TEST
+    void retune_pace_timer() {
+        if (pace_timer < 0) {
+            return;
+        }
+        uint32_t mhz = clock_get_hz(clk_sys) / 1000000u;
+        if (mhz == 0u) {
+            mhz = 250u;
+        }
+        uint32_t div = (uint32_t)((uint64_t)frame_period_us * mhz / GB_AUDIO_FRAME_SAMPLES);
+        div -= div / 2500u; // Consumption runs +0.04% above production so drift stalls briefly instead of dropping
+        div = std::clamp<uint32_t>(div, 1u, 65535u);
+        dma_timer_set_fraction((uint)pace_timer, 1, (uint16_t)div);
+    }
+
+    void set_frame_period_us(uint32_t us) {
+        if (us == 0u) {
+            return;
+        }
+        frame_period_us = us;
+        retune_pace_timer();
+    }
+
     void init() {
         // Stop PicoSystem's built-in 1 ms audio timer so we own PWM Slice 5 exclusively
         cancel_repeating_timer(&picosystem::_audio_update_timer);
@@ -848,49 +886,69 @@ struct GbAudioDriver {
         pwm_config cfg = pwm_get_default_config();
         pwm_init(audio_slice, &cfg, true);
         gpio_set_function(GB_AUDIO_PIN, GPIO_FUNC_PWM);
+        // 12 mA drive + fast slew maximizes piezo voltage swing at the 61 kHz carrier
+        gpio_set_drive_strength(GB_AUDIO_PIN, GPIO_DRIVE_STRENGTH_12MA);
+        gpio_set_slew_rate(GB_AUDIO_PIN, GPIO_SLEW_RATE_FAST);
 
-        pwm_config pacer_cfg = pwm_get_default_config();
-        pwm_init(GB_AUDIO_TIMER_SLICE, &pacer_cfg, false);
+        if (!dma_initialized) {
+            pace_timer = dma_claim_unused_timer(true);
+            retune_pace_timer();
 
-        irq_set_exclusive_handler(PWM_IRQ_WRAP, gb_audio_pwm_irq_handler);
+            dma_channel_claim(GB_AUDIO_DMA_CH);
+            dma_channel_config dcfg = dma_channel_get_default_config(GB_AUDIO_DMA_CH);
+            channel_config_set_transfer_data_size(&dcfg, DMA_SIZE_32);
+            channel_config_set_read_increment(&dcfg, true);
+            channel_config_set_write_increment(&dcfg, false);
+            channel_config_set_dreq(&dcfg, dma_get_timer_dreq((uint)pace_timer));
+            dma_channel_configure(
+                GB_AUDIO_DMA_CH,
+                &dcfg,
+                &pwm_hw->slice[audio_slice].cc,
+                nullptr,
+                GB_AUDIO_FRAME_SAMPLES,
+                false
+            );
+            dma_channel_set_irq1_enabled(GB_AUDIO_DMA_CH, true);
+            irq_set_exclusive_handler(DMA_IRQ_1, gb_audio_dma_irq_handler);
+            dma_initialized = true;
+        }
+
         set_mode(AUDIO_PIEZO_BEEP);
+    }
+
+    void stop_dma_and_silence() {
+        const uint audio_slice = pwm_gpio_to_slice_num(GB_AUDIO_PIN);
+        const uint chan = pwm_gpio_to_channel(GB_AUDIO_PIN);
+        irq_set_enabled(DMA_IRQ_1, false);
+        if (dma_initialized) {
+            dma_channel_abort(GB_AUDIO_DMA_CH);
+            dma_irqn_acknowledge_channel(1, GB_AUDIO_DMA_CH);
+        }
+        buf_pending = false;
+        dma_idle = true;
+        pwm_set_chan_level(audio_slice, chan, 0);
     }
 
     void pause() {
         paused = true;
-        const uint audio_slice = pwm_gpio_to_slice_num(GB_AUDIO_PIN);
-        const uint chan = pwm_gpio_to_channel(GB_AUDIO_PIN);
-        irq_set_enabled(PWM_IRQ_WRAP, false);
-        pwm_set_irq_enabled(GB_AUDIO_TIMER_SLICE, false);
-        pwm_set_enabled(GB_AUDIO_TIMER_SLICE, false);
-        pwm_clear_irq(GB_AUDIO_TIMER_SLICE);
-        last_pwm_level = 0;
-        pwm_set_chan_level(audio_slice, chan, 0);
+        stop_dma_and_silence();
     }
 
     void resume() {
         paused = false;
-        ring_read = 0;
-        ring_write = 0;
-        last_pwm_level = 0;
+        play_buf_idx = 0;
+        buf_pending = false;
+        dma_idle = true;
         last_beep_freq = 0;
         set_mode(mode);
     }
 
     void set_mode(AudioMode next_mode) {
         const uint audio_slice = pwm_gpio_to_slice_num(GB_AUDIO_PIN);
-        const uint chan = pwm_gpio_to_channel(GB_AUDIO_PIN);
 
-        irq_set_enabled(PWM_IRQ_WRAP, false);
-        pwm_set_irq_enabled(GB_AUDIO_TIMER_SLICE, false);
-        pwm_set_enabled(GB_AUDIO_TIMER_SLICE, false);
-        pwm_clear_irq(GB_AUDIO_TIMER_SLICE);
-        pwm_set_chan_level(audio_slice, chan, 0);
-
+        stop_dma_and_silence();
         mode = next_mode;
-        ring_read = 0;
-        ring_write = 0;
-        last_pwm_level = 0;
+        play_buf_idx = 0;
         last_beep_freq = 0;
 
         if (paused) {
@@ -898,30 +956,20 @@ struct GbAudioDriver {
         }
 
         if (mode == AUDIO_PWM_APU) {
-            float sys_hz = (float)clock_get_hz(clk_sys);
-            // 61.0 kHz ultrasonic PWM carrier on Slice 5B for stronger piezo drive without switching loss
-            float carrier_div = sys_hz / (GB_AUDIO_PWM_CARRIER_HZ * (float)(GB_AUDIO_PWM_WRAP + 1u));
-            if (carrier_div < 1.0f) carrier_div = 1.0f;
-            pwm_set_clkdiv(audio_slice, carrier_div);
+            // 12-bit 61.035 kHz ultrasonic PWM carrier on Slice 5B (clkdiv = 1, wrap = 4095)
+            pwm_set_clkdiv(audio_slice, 1.0f);
             pwm_set_wrap(audio_slice, GB_AUDIO_PWM_WRAP);
             pwm_set_counter(audio_slice, 0);
-            pwm_set_chan_level(audio_slice, chan, 0);
+            pwm_set_chan_level(audio_slice, pwm_gpio_to_channel(GB_AUDIO_PIN), 0);
 
-            // 32.8 kHz sample-rate pacer IRQ on internal Slice 0
-            float pacer_div = sys_hz / ((float)GB_AUDIO_SAMPLE_RATE * (float)(GB_AUDIO_PACER_WRAP + 1u));
-            if (pacer_div < 1.0f) pacer_div = 1.0f;
-            pwm_set_clkdiv(GB_AUDIO_TIMER_SLICE, pacer_div);
-            pwm_set_wrap(GB_AUDIO_TIMER_SLICE, GB_AUDIO_PACER_WRAP);
-            pwm_set_counter(GB_AUDIO_TIMER_SLICE, 0);
-            pwm_clear_irq(GB_AUDIO_TIMER_SLICE);
-            pwm_set_irq_enabled(GB_AUDIO_TIMER_SLICE, true);
-            pwm_set_enabled(GB_AUDIO_TIMER_SLICE, true);
-            irq_set_enabled(PWM_IRQ_WRAP, true);
+            retune_pace_timer();
+            dma_irqn_acknowledge_channel(1, GB_AUDIO_DMA_CH);
+            irq_set_enabled(DMA_IRQ_1, true);
         } else if (mode == AUDIO_PIEZO_BEEP) {
             pwm_set_clkdiv(audio_slice, 10.0f);
             pwm_set_wrap(audio_slice, 5000u);
             pwm_set_counter(audio_slice, 0);
-            pwm_set_chan_level(audio_slice, chan, 0);
+            pwm_set_chan_level(audio_slice, pwm_gpio_to_channel(GB_AUDIO_PIN), 0);
         }
     }
 
@@ -945,24 +993,28 @@ struct GbAudioDriver {
         apu.advance_frame_ages();
 
         if (mode == AUDIO_PWM_APU) {
-            uint32_t r = ring_read;
-            uint32_t w = ring_write;
-            uint32_t avail = (w - r) & RING_MASK;
-            uint32_t free_space = (RING_SIZE - 1u) - avail;
+            uint32_t save = save_and_disable_interrupts();
+            buf_pending = false;
+            uint8_t fill_idx = play_buf_idx ^ 1u;
+            restore_interrupts(save);
 
-            int32_t needed = (int32_t)TARGET_BUFFER_SAMPLES - (int32_t)avail;
-            if (needed < 0) needed = 0;
-            if (needed > 1200) needed = 1200;
-            if ((uint32_t)needed > free_space) needed = (int32_t)free_space;
-
-            for (int32_t i = 0; i < needed; ++i) {
-                ring[w] = apu.render_sample();
-                w = (w + 1u) & RING_MASK;
+            uint32_t *out = duty_buf[fill_idx];
+            for (uint32_t i = 0; i < GB_AUDIO_FRAME_SAMPLES; ++i) {
+                out[i] = ((uint32_t)apu.render_sample()) << 16;
             }
-            __dmb();
-            ring_write = w;
+
+            save = save_and_disable_interrupts();
+            if (dma_idle) {
+                dma_idle = false;
+                play_buf_idx = fill_idx;
+                dma_channel_set_read_addr(GB_AUDIO_DMA_CH, out, false);
+                dma_channel_set_trans_count(GB_AUDIO_DMA_CH, GB_AUDIO_FRAME_SAMPLES, true);
+            } else {
+                buf_pending = true;
+            }
+            restore_interrupts(save);
         } else if (mode == AUDIO_PIEZO_BEEP) {
-            for (uint32_t i = 0; i < 549u; ++i) {
+            for (uint32_t i = 0; i < GB_AUDIO_FRAME_SAMPLES; ++i) {
                 (void)apu.render_sample();
             }
 
@@ -999,12 +1051,18 @@ struct GbAudioDriver {
                 pwm_set_chan_level(slice, chan, (uint16_t)level);
             }
         } else {
-            for (uint32_t i = 0; i < 549u; ++i) {
+            for (uint32_t i = 0; i < GB_AUDIO_FRAME_SAMPLES; ++i) {
                 (void)apu.render_sample();
             }
         }
     }
 #else
+    void set_frame_period_us(uint32_t us) {
+        if (us > 0u) {
+            frame_period_us = us;
+        }
+    }
+
     void init() {
         apu.reset();
         paused = false;
@@ -1013,21 +1071,23 @@ struct GbAudioDriver {
 
     void pause() {
         paused = true;
+        buf_pending = false;
+        dma_idle = true;
     }
 
     void resume() {
         paused = false;
-        ring_read = 0;
-        ring_write = 0;
-        last_pwm_level = 0;
+        play_buf_idx = 0;
+        buf_pending = false;
+        dma_idle = true;
         last_beep_freq = 0;
     }
 
     void set_mode(AudioMode next_mode) {
         mode = next_mode;
-        ring_read = 0;
-        ring_write = 0;
-        last_pwm_level = 0;
+        play_buf_idx = 0;
+        buf_pending = false;
+        dma_idle = true;
         last_beep_freq = 0;
     }
 
@@ -1050,21 +1110,18 @@ struct GbAudioDriver {
         }
         apu.advance_frame_ages();
         if (mode == AUDIO_PWM_APU) {
-            uint32_t r = ring_read;
-            uint32_t w = ring_write;
-            uint32_t avail = (w - r) & RING_MASK;
-            uint32_t free_space = (RING_SIZE - 1u) - avail;
-            int32_t needed = (int32_t)TARGET_BUFFER_SAMPLES - (int32_t)avail;
-            if (needed < 0) needed = 0;
-            if (needed > 1200) needed = 1200;
-            if ((uint32_t)needed > free_space) needed = (int32_t)free_space;
-            for (int32_t i = 0; i < needed; ++i) {
-                ring[w] = apu.render_sample();
-                w = (w + 1u) & RING_MASK;
+            uint8_t fill_idx = play_buf_idx ^ 1u;
+            for (uint32_t i = 0; i < GB_AUDIO_FRAME_SAMPLES; ++i) {
+                duty_buf[fill_idx][i] = ((uint32_t)apu.render_sample()) << 16;
             }
-            ring_write = w;
+            if (dma_idle) {
+                dma_idle = false;
+                play_buf_idx = fill_idx;
+            } else {
+                buf_pending = true;
+            }
         } else {
-            for (uint32_t i = 0; i < 549u; ++i) {
+            for (uint32_t i = 0; i < GB_AUDIO_FRAME_SAMPLES; ++i) {
                 (void)apu.render_sample();
             }
             if (mode == AUDIO_PIEZO_BEEP) {
@@ -1079,23 +1136,22 @@ struct GbAudioDriver {
 };
 
 #ifndef GB_AUDIO_HOST_TEST
-static void __not_in_flash_func(gb_audio_pwm_irq_handler)() {
-    pwm_clear_irq(GB_AUDIO_TIMER_SLICE);
+static void __not_in_flash_func(gb_audio_dma_irq_handler)() {
+    dma_irqn_acknowledge_channel(1, GB_AUDIO_DMA_CH);
 
     GbAudioDriver *drv = g_gb_audio_driver;
     if (!drv) {
         return;
     }
 
-    uint32_t r = drv->ring_read;
-    uint16_t level = drv->last_pwm_level;
-    if (r != drv->ring_write) {
-        level = drv->ring[r];
-        __dmb();
-        drv->ring_read = (r + 1u) & GbAudioDriver::RING_MASK;
-        drv->last_pwm_level = level;
+    if (drv->buf_pending) {
+        drv->buf_pending = false;
+        uint8_t next_idx = drv->play_buf_idx ^ 1u;
+        drv->play_buf_idx = next_idx;
+        dma_channel_set_read_addr(GB_AUDIO_DMA_CH, drv->duty_buf[next_idx], false);
+        dma_channel_set_trans_count(GB_AUDIO_DMA_CH, GB_AUDIO_FRAME_SAMPLES, true);
+    } else {
+        drv->dma_idle = true;
     }
-    const uint audio_slice = pwm_gpio_to_slice_num(GB_AUDIO_PIN);
-    pwm_set_chan_level(audio_slice, pwm_gpio_to_channel(GB_AUDIO_PIN), level);
 }
 #endif

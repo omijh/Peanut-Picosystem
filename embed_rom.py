@@ -3,11 +3,21 @@ import os
 import sys
 
 MIN_GB_ROM_BYTES = 0x150
-MAX_GB_ROM_BYTES = 14 * 1024 * 1024
+MAX_GB_ROM_BYTES = 12 * 1024 * 1024
+
+
+def read_rom_mode(data: bytes) -> str:
+    cgb_flag = data[0x0143]
+    if cgb_flag == 0xC0:
+        return "GBC"
+    if (cgb_flag & 0x80) != 0:
+        return "GBC+DMG"
+    return "DMG"
 
 
 def read_rom_title(data: bytes) -> str:
-    raw = data[0x0134:0x0144]
+    end = 0x0143 if (data[0x0143] & 0x80) != 0 else 0x0144
+    raw = data[0x0134:end]
     chars = []
     for b in raw:
         if b == 0:
@@ -19,7 +29,7 @@ def read_rom_title(data: bytes) -> str:
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python3 embed_rom.py <path_to_game.gb> [output_file.h]")
+        print("Usage: python3 embed_rom.py <path_to_game.gb|.gbc> [output_file.h]")
         sys.exit(1)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -36,7 +46,7 @@ def main():
     size = len(data)
     if size < MIN_GB_ROM_BYTES:
         print(
-            f"Error: '{rom_path}' is too small ({size} bytes; minimum valid GB ROM header is {MIN_GB_ROM_BYTES} bytes).",
+            f"Error: '{rom_path}' is too small ({size} bytes; minimum valid GB/GBC ROM header is {MIN_GB_ROM_BYTES} bytes).",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -48,15 +58,17 @@ def main():
         sys.exit(1)
 
     title = read_rom_title(data)
-    title_info = f" [{title}]" if title else ""
-    print(f"Embedding '{rom_path}'{title_info} ({size} bytes, {size / 1024:.1f} KB) -> '{out_path}'...")
+    mode = read_rom_mode(data)
+    meta = f" [{title} | {mode}]" if title else f" [{mode}]"
+    print(f"Embedding '{rom_path}'{meta} ({size} bytes, {size / 1024:.1f} KB) -> '{out_path}'...")
 
     with open(out_path, "w") as out:
-        out.write("/* Auto-generated ROM file for Peanut-GB PicoSystem */\n")
+        out.write("/* Auto-generated ROM file for Walnut-CGB PicoSystem */\n")
         out.write("#pragma once\n\n")
         out.write(f"// Original file: {os.path.basename(rom_path)}\n")
         if title:
             out.write(f"// Title: {title}\n")
+        out.write(f"// Mode: {mode}\n")
         out.write(f"// Size: {size} bytes\n")
         out.write(f"const unsigned int custom_rom_len = {size};\n")
         out.write("const unsigned char custom_rom_data[] = {\n")
