@@ -27,7 +27,8 @@ Because the RP2040 has 264 KB of SRAM, memory layout must be managed strictly:
 | **PicoSystem Framebuffer (`SCREEN`)** | SRAM | **115.2 KB** | 240 × 240 × 2 bytes. Retained between frames. |
 | **Peanut-GB CPU & State (`gb_s`)** | SRAM | **~17.1 KB** | Includes 8 KB WRAM, 8 KB VRAM, OAM, HRAM, and CPU registers. |
 | **Cartridge Battery RAM (`cart_ram`)** | SRAM | **32 KB** | Accommodates 4 banks of 8 KB (sufficient for MBC1, MBC2, and MBC3 / Pokémon Gen 1 & 2). |
-| **Free SRAM Headroom** | SRAM | **~99 KB** | Available for stack, heap, and runtime. |
+| **Game Boy Audio (`gb_audio`)** | SRAM | **~4.3 KB** | `GbApu` state (~250 B) + 2048-sample `uint16_t` PWM ring buffer (4 KB). |
+| **Free SRAM Headroom** | SRAM | **~95 KB** | Available for stack, heap, and runtime. |
 | **Game Boy ROM (`custom_rom_data`)** | **Flash** | **Up to ~14 MB** | Marked `const` so it lives in Flash and executes in place via XIP cache. Never copy ROMs into RAM. |
 | **Save State Sector** | **Flash** | **64 KB** | Reserved at offset `15 MB` (`0x00F00000`) for full emulator snapshot + SRAM. |
 
@@ -41,7 +42,7 @@ Because the RP2040 has 264 KB of SRAM, memory layout must be managed strictly:
 Because many action and homebrew Game Boy games (such as *Karpe Diem*) do not have in-game battery save menus, the emulator implements a **Full Save State Engine**:
 
 1. **State Snapshot Payload**:
-   - `StateHeader` (magic `0x53544154` / "STAT", version, payload sizes, 32-bit checksum).
+   - `StateHeader` (magic `0x53544154` / "STAT", version, payload sizes, 32-bit FNV-1a checksum, ROM header hash, and packed user settings: Volume, Brightness, Audio Mode, Palette, Display Mode).
    - Entire `struct gb_s` (~17.1 KB): CPU registers (PC, SP, A, F, BC, DE, HL), timers, flags, 8 KB WRAM, 8 KB VRAM, OAM, HRAM.
    - `cart_ram` (32 KB): Cartridge SRAM.
    - Total payload: ~49.9 KB.
@@ -76,10 +77,13 @@ The emulator supports three modes (switched with `X + Y + DOWN`):
 ## 5. Key Files & Responsibilities
 
 - **`main.cpp`**:
-  - `init()`: Sets up LUT tables, checks Flash for saved state (with auto-resume), initializes Peanut-GB, and sets up LCD line renderer.
-  - `update(uint32_t tick)`: Polls buttons, checks hold combos (Quick Save: `X + Y`, Quick Load: `A + B`, Hotkeys: `X+Y+UP` / `X+Y+DOWN`), runs `gb_run_frame(&gb)`.
-  - `draw(uint32_t tick)`: Renders bezels (if in letterbox/centered mode) and onscreen notification banners.
-  - `save_state_to_flash()` / `load_state_from_flash()`: Serializes and restores the full emulator state.
+  - `init()`: Initializes `gb_audio` and screen backlight (`brightness_pct`), sets up LUT tables, checks Flash for saved state (with auto-resume), initializes Peanut-GB, and sets up LCD line renderer.
+  - `update(uint32_t tick)`: Polls buttons, runs paused Quick Settings Menu (`X+Y+LEFT`) for Volume/Brightness/Audio/Palette/Display, checks hold combos (Quick Save: `X + Y`, Quick Load: `A + B`, Hotkeys: `X+Y+UP` / `X+Y+DOWN` / `X+Y+RIGHT`), runs `gb_run_frame(&gb)` and `gb_audio.update_frame()`.
+  - `draw(uint32_t tick)`: Renders bezels (if in letterbox/centered mode), the Quick Settings Menu overlay, and onscreen notification banners.
+  - `save_state_to_flash()` / `load_state_from_flash()`: Serializes and restores the full emulator state (pausing/resuming audio around Flash writes and syncing APU state on load).
+- **`gb_audio.hpp`**:
+  - `GbApu`: 4-channel DMG APU (Pulse 1 + Sweep, Pulse 2, Wave RAM, LFSR Noise) with zero-DC 32,768 Hz mixing, ~5.2 kHz 1-pole LPF, soft-clipped gain boost, master volume scaling (`0..100%`, default `30%`), `NR52` power/status tracking, and direct piezo tone extraction.
+  - `GbAudioDriver`: Defaults to `AUDIO_PIEZO_BEEP`; drives GPIO 11 (PWM Slice 5B) via direct frequency beeper (`AUDIO_PIEZO_BEEP`), 61.0 kHz ultrasonic PWM carrier + Slice 0 32.8 kHz pacer IRQ ring buffer (`AUDIO_PWM_APU`), or mute (`AUDIO_OFF`), with `pause()` / `resume()` guards.
 - **`peanut_gb.h`**:
   - Upstream single-header Game Boy DMG emulator core.
 - **`embed_rom.py`**:
